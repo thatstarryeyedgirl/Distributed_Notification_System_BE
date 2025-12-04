@@ -1,0 +1,296 @@
+name: Distributed Notification System CI/CD
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: test_db
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+      
+      rabbitmq:
+        image: rabbitmq:3-management
+        env:
+          RABBITMQ_DEFAULT_USER: guest
+          RABBITMQ_DEFAULT_PASS: guest
+        ports:
+          - 5672:5672
+          - 15672:15672
+      
+      redis:
+        image: redis:6-alpine
+        ports:
+          - 6379:6379
+
+    strategy:
+      matrix:
+        service: [api_gateway_service, user_service, template_service, email_service, push_service, admin_service]
+
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.12'
+    
+    - name: Cache pip dependencies
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
+    
+    - name: Install dependencies
+      run: |
+        cd ${{ matrix.service }}
+        pip install --upgrade pip
+        pip install -r requirements.txt
+    
+    - name: Run migrations
+      env:
+        DB_ENGINE: django.db.backends.postgresql
+        DB_NAME: test_db
+        DB_USER: postgres
+        DB_PASSWORD: postgres
+        DB_HOST: localhost
+        DB_PORT: 5432
+        RABBITMQ_URL: amqp://guest:guest@localhost:5672/
+        REDIS_URL: redis://localhost:6379/0
+      run: |
+        cd ${{ matrix.service }}
+        python manage.py migrate --noinput
+    
+    - name: Run tests
+      env:
+        DB_ENGINE: django.db.backends.postgresql
+        DB_NAME: test_db
+        DB_USER: postgres
+        DB_PASSWORD: postgres
+        DB_HOST: localhost
+        DB_PORT: 5432
+        RABBITMQ_URL: amqp://guest:guest@localhost:5672/
+        REDIS_URL: redis://localhost:6379/0
+      run: |
+        cd ${{ matrix.service }}
+        python manage.py test --verbosity=2
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    
+    strategy:
+      matrix:
+        service: [api_gateway_service, user_service, template_service, email_service, push_service, admin_service]
+
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+    
+    - name: Log in to Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/${{ matrix.service }}
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=sha,prefix={{branch}}-
+          type=raw,value=latest,enable={{is_default_branch}}
+    
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: ./${{ matrix.service }}
+        platforms: linux/amd64,linux/arm64
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+  deploy-staging:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/develop'
+    environment: staging
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Deploy to Staging
+      env:
+        DEPLOY_HOST: ${{ secrets.STAGING_HOST }}
+        DEPLOY_USER: ${{ secrets.STAGING_USER }}
+        DEPLOY_KEY: ${{ secrets.STAGING_SSH_KEY }}
+      run: |
+        echo "$DEPLOY_KEY" > deploy_key
+        chmod 600 deploy_key
+        
+        # Copy docker-compose to staging server
+        scp -i deploy_key -o StrictHostKeyChecking=no docker-compose.yml $DEPLOY_USER@$DEPLOY_HOST:/opt/notification-system/
+        
+        # Deploy to staging
+        ssh -i deploy_key -o StrictHostKeyChecking=no $DEPLOY_USER@$DEPLOY_HOST << 'EOF'
+          cd /opt/notification-system
+          docker-compose pull
+          docker-compose up -d --remove-orphans
+          docker system prune -f
+        EOF
+        
+        rm deploy_key
+
+  deploy-production:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    environment: production
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup kubectl
+      uses: azure/setup-kubectl@v3
+      with:
+        version: 'v1.28.0'
+    
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ secrets.AWS_REGION }}
+    
+    - name: Update kubeconfig
+      run: |
+        aws eks update-kubeconfig --region ${{ secrets.AWS_REGION }} --name ${{ secrets.EKS_CLUSTER_NAME }}
+    
+    - name: Deploy to Kubernetes
+      run: |
+        # Create namespace
+        kubectl create namespace notification-system --dry-run=client -o yaml | kubectl apply -f -
+        
+        # Deploy services
+        for service in api_gateway_service user_service template_service email_service push_service admin_service; do
+          port=$((8000 + $(echo $service | grep -o '[0-9]' | head -1 || echo 0)))
+          
+          cat <<EOF | kubectl apply -f -
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: ${service}
+          namespace: notification-system
+        spec:
+          replicas: 2
+          selector:
+            matchLabels:
+              app: ${service}
+          template:
+            metadata:
+              labels:
+                app: ${service}
+            spec:
+              containers:
+              - name: ${service}
+                image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/${service}:${{ github.sha }}
+                ports:
+                - containerPort: ${port}
+                env:
+                - name: DB_ENGINE
+                  value: "django.db.backends.postgresql"
+                - name: RABBITMQ_URL
+                  value: "amqp://guest:guest@rabbitmq:5672/"
+                - name: REDIS_URL
+                  value: "redis://redis:6379/0"
+                resources:
+                  requests:
+                    memory: "256Mi"
+                    cpu: "250m"
+                  limits:
+                    memory: "512Mi"
+                    cpu: "500m"
+                livenessProbe:
+                  httpGet:
+                    path: /api/v1/health/
+                    port: ${port}
+                  initialDelaySeconds: 30
+                  periodSeconds: 10
+                readinessProbe:
+                  httpGet:
+                    path: /api/v1/health/
+                    port: ${port}
+                  initialDelaySeconds: 5
+                  periodSeconds: 5
+        ---
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: ${service}
+          namespace: notification-system
+        spec:
+          selector:
+            app: ${service}
+          ports:
+          - port: ${port}
+            targetPort: ${port}
+          type: ClusterIP
+        EOF
+        done
+    
+    - name: Wait for deployment
+      run: |
+        kubectl rollout status deployment/api_gateway_service -n notification-system --timeout=300s
+        kubectl rollout status deployment/user_service -n notification-system --timeout=300s
+        kubectl rollout status deployment/email_service -n notification-system --timeout=300s
+        kubectl rollout status deployment/push_service -n notification-system --timeout=300s
+    
+    - name: Run health checks
+      run: |
+        sleep 30
+        kubectl get pods -n notification-system
+        kubectl get services -n notification-system
+    
+    - name: Notify deployment success
+      if: success()
+      run: |
+        echo "✅ Deployment successful to production!"
+    
+    - name: Rollback on failure
+      if: failure()
+      run: |
+        echo "❌ Deployment failed, rolling back..."
+        kubectl rollout undo deployment/api_gateway_service -n notification-system
+        kubectl rollout undo deployment/user_service -n notification-system
+        kubectl rollout undo deployment/email_service -n notification-system
+        kubectl rollout undo deployment/push_service -n notification-system

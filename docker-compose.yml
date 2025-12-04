@@ -1,0 +1,171 @@
+name: distributed-notification-system
+
+services:
+  redis:
+    image: redis:6-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  api_gateway:
+    build: ./api_gateway_service
+    ports:
+      - "8000:8000"
+    environment:
+      - DB_ENGINE=django.db.backends.postgresql
+      - DB_NAME=api_gateway_db
+      - DB_USER=postgres
+      - DB_PASSWORD=AdaMuonso1_
+      - DB_HOST=host.docker.internal
+      - DB_PORT=5432
+      - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
+      - REDIS_URL=redis://redis:6379/0
+      - USER_SERVICE_URL=http://user_service:8001
+      - API_GATEWAY_SERVICE_KEY=
+      - USER_SERVICE_KEY=
+      - TEMPLATE_SERVICE_KEY=
+      - EMAIL_SERVICE_KEY=
+      - PUSH_SERVICE_KEY=
+      - ADMIN_SERVICE_KEY=
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  user_service:
+    build: ./user_service
+    ports:
+      - "8001:8001"
+    environment:
+      - DB_ENGINE=django.db.backends.postgresql
+      - DB_NAME=user_service_db
+      - DB_USER=postgres
+      - DB_PASSWORD=AdaMuonso1_
+      - DB_HOST=host.docker.internal
+      - DB_PORT=5432
+      - REDIS_URL=redis://redis:6379/0
+      - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
+      - USER_SERVICE_KEY=
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  template_service:
+    build: ./template_service
+    ports:
+      - "8002:8002"
+    environment:
+      - DB_ENGINE=django.db.backends.postgresql
+      - DB_NAME=template_service_db
+      - DB_USER=postgres
+      - DB_PASSWORD=AdaMuonso1_
+      - DB_HOST=host.docker.internal
+      - DB_PORT=5432
+      - TEMPLATE_SERVICE_KEY=
+    restart: unless-stopped
+
+  email_service:
+    build: ./email_service
+    ports:
+      - "8003:8003"
+    environment:
+      - DB_ENGINE=django.db.backends.postgresql
+      - DB_NAME=email_service_db
+      - DB_USER=postgres
+      - DB_PASSWORD=AdaMuonso1_
+      - DB_HOST=host.docker.internal
+      - DB_PORT=5432
+      - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
+      - REDIS_URL=redis://redis:6379/0
+      - USER_SERVICE_URL=http://user_service:8001
+      - TEMPLATE_SERVICE_URL=http://template_service:8002
+      - SMTP_HOST=smtp.gmail.com
+      - SMTP_PORT=587
+      - SMTP_USERNAME=inesessence.xo@gmail.com
+      - SMTP_PASSWORD=xguz jmoc yewm bnpd
+      - FROM_EMAIL=distributednotification@noreply.com
+      - EMAIL_PORT=587
+      - EMAIL_SERVICE_KEY=
+      - USER_SERVICE_KEY=
+      - TEMPLATE_SERVICE_KEY=
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  push_service:
+    build: ./push_service
+    ports:
+      - "8004:8004"
+    environment:
+      - DB_ENGINE=django.db.backends.postgresql
+      - DB_NAME=push_service_db
+      - DB_USER=postgres
+      - DB_PASSWORD=AdaMuonso1_
+      - DB_HOST=host.docker.internal
+      - DB_PORT=5432
+      - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
+      - FCM_SERVICE_ACCOUNT_KEY_PATH=/app/firebase-service-account.json
+      - PUSH_SERVICE_KEY=push_key_12345
+      - USER_SERVICE_KEY=user_key_12345
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+
+  admin_service:
+    build: ./admin_service
+    ports:
+      - "8005:8005"
+    environment:
+      - DB_ENGINE=django.db.backends.postgresql
+      - DB_NAME=admin_service_db
+      - DB_USER=postgres
+      - DB_PASSWORD=AdaMuonso1_
+      - DB_HOST=host.docker.internal
+      - DB_PORT=5432
+      - API_GATEWAY_URL=http://api_gateway:8000
+      - ADMIN_SERVICE_KEY=admin_key_12345
+      - API_GATEWAY_SERVICE_KEY=gw_key_12345
+    restart: unless-stopped
+
+volumes:
+  postgres_api_data:
+  postgres_user_data:
+  postgres_template_data:
+  postgres_email_data:
+  postgres_push_data:
+  postgres_admin_data:
+  redis_data:
+  rabbitmq_data:
+
+networks:
+  default:
+    driver: bridge
